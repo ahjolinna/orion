@@ -1,0 +1,1248 @@
+/*
+ * Copyright © 2015-2016 Antti Lamminsalo
+ *
+ * This file is part of Orion.
+ *
+ * Orion is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Orion.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "channelmanager.h"
+#include <QStringRef>
+#include <QDir>
+#include <QProcess>
+#include "../util/fileutils.h"
+#include <QThread>
+#include <QApplication>
+#include <QStandardPaths>
+
+BadgeImageProvider::BadgeImageProvider(ChannelManager * channelManager, bool hiDpi) : ImageProvider("badge", ".png"), _channelManager(channelManager), _hiDpi(hiDpi) {
+    
+}
+
+QString BadgeImageProvider::getCanonicalKey(QString key) {
+    /** Resolve a key with just a badge name and version, specific to the current room, to a globally unique key for an official API or beta API badge */
+    QString url;
+
+    const QString betaImageFormat = _hiDpi? "image_url_2x" : "image_url_1x";
+    const QString officialImageFormat = "image";
+
+    int splitPos = key.indexOf("-");
+    if (splitPos != -1) {
+        const QString badge = key.left(splitPos);
+        const QString version = key.mid(splitPos + 1);
+        //qDebug() << "badge hunt: channel name" << _channelName << "channel id" << _channelId << "badge" << badge << "version" << version;
+
+        if (_channelManager->getChannelBadgeBetaUrl(_channelId, badge, version, betaImageFormat, url)) {
+            return QList<QString>({ _channelId, badge, version, betaImageFormat }).join("-");
+        }
+        if (_channelManager->getChannelBadgeBetaUrl("GLOBAL", badge, version, betaImageFormat, url)) {
+            return QList<QString>({ "GLOBAL", badge, version, betaImageFormat }).join("-");
+        }
+        if (_channelManager->getChannelBadgeUrl(_channelId, badge, officialImageFormat, url)) {
+            return QList<QString>({ _channelName, badge, officialImageFormat }).join("-");
+        }
+        if (_channelManager->getChannelBadgeUrl("GLOBAL", badge, officialImageFormat, url)) {
+            return QList<QString>({ "GLOBAL", badge, officialImageFormat }).join("-");
+        }
+    }
+
+    qDebug() << "getCanonicalKey for badge" << key << "could not find a badge";
+    return key;
+}
+
+const QUrl BadgeImageProvider::getUrlForKey(QString & key) {
+    QString url;
+
+    QList<QString> parts = key.split("-");
+    if (parts.length() == 3) {
+        if (_channelManager->getChannelBadgeUrl(parts[0], parts[1], parts[2], url)) {
+            return url;
+        }
+    }
+    else if (parts.length() == 4) {
+        if (_channelManager->getChannelBadgeBetaUrl(parts[0], parts[1], parts[2], parts[3], url)) {
+            return url;
+        }
+    }
+    qDebug() << "Invalid badge cache key" << key;
+    return QUrl();
+}
+
+BitsImageProvider::BitsImageProvider(ChannelManager * channelManager, bool hiDpi) : ImageProvider("bits", ".gif"), _channelManager(channelManager), _hiDpi(hiDpi) {
+
+}
+
+QString BitsImageProvider::getCanonicalKey(QString key) {
+    // input key has a prefix and a bits level, separated by a -
+
+    QString globalUrl;
+    QString channelUrl;
+    
+    const QString theme = "dark";
+    const QString type = "animated";
+    const QString size = _hiDpi? "2" : "1";
+
+    int splitPos = key.indexOf('-');
+    if (splitPos != -1) {
+        QString prefix = key.left(splitPos);
+        QString minBits = key.mid(splitPos + 1);
+
+        bool foundGlobalUrl = _channelManager->getChannelBitsUrl(-1, prefix, minBits, globalUrl);
+
+        if (_channelManager->getChannelBitsUrl(_channelId, prefix, minBits, channelUrl)) {
+            if (!foundGlobalUrl || channelUrl != globalUrl) {
+                return QList<QString>({ QString::number(_channelId), theme, type, size, prefix, minBits }).join("-");
+            }
+        }
+        if (foundGlobalUrl) {
+            return QList<QString>({ "GLOBAL", theme, type, size, prefix, minBits }).join("-");
+        }
+    }
+    qDebug() << "can't canonicalize" << key << "couldn't find that bits badge";
+    return key;
+}
+
+const QUrl ChannelManager::getBitsUrlForKey(const QString & key) const {
+    QString url;
+
+    QList<QString> parts = key.split("-");
+    if (parts.length() == 6) {
+        const QString & channelIdStr = parts[0];
+        const QString & prefix = parts[4];
+        const QString & minBits = parts[5];
+        const int channelId = channelIdStr == "GLOBAL" ? -1 : channelIdStr.toInt();
+
+        if (getChannelBitsUrl(channelId, prefix, minBits, url)) {
+            return url;
+        }
+    }
+    qDebug() << "Invalid bits cache key" << key;
+    return QUrl();
+}
+
+const QUrl BitsImageProvider::getUrlForKey(QString & key) {
+    return _channelManager->getBitsUrlForKey(key);
+}
+
+
+ChannelListModel *ChannelManager::createFollowedChannelsModel()
+{
+    ChannelListModel *model = new ChannelListModel();
+
+    connect(model, &ChannelListModel::channelOnlineStateChanged, this, &ChannelManager::notify);
+    connect(model, &ChannelListModel::multipleChannelsChangedOnline, this, &ChannelManager::notifyMultipleChannelsOnline);
+
+    return model;
+}
+
+bool FavourtiteSortFilterProxyModel::lessThan(const QModelIndex &left, const QModelIndex &right) const
+{
+    qint32 leftViewers = sourceModel()->data(left, ChannelListModel::Roles::ViewersRole).toInt();
+    qint32 rightViewers = sourceModel()->data(right, ChannelListModel::Roles::ViewersRole).toInt();
+    bool leftHasViewers = leftViewers > 0;
+    bool rightHasViewers = rightViewers > 0;
+
+    QString leftName = sourceModel()->data(left, ChannelListModel::Roles::NameRole).toString();
+    QString rightName = sourceModel()->data(right, ChannelListModel::Roles::NameRole).toString();
+
+    if (leftHasViewers == rightHasViewers) {
+        return rightName.compare(leftName, Qt::CaseSensitivity::CaseInsensitive) < 0;
+    } else {
+        return rightHasViewers;
+    }
+
+}
+
+ChannelManager::ChannelManager(NetworkManager *netman, bool hiDpi) : netman(netman), badgeImageProvider(this, hiDpi), bitsImageProvider(this, hiDpi) {
+    user_id = 0;
+    access_token = "";
+    tempFavourites = 0;
+
+    alert = true;
+    closeToTray = false;
+    alertPosition = 1;
+    minimizeOnStartup = false;
+    _textScaleFactor = 1.0;
+
+    lowLatencyStreams = true;
+
+    resultsModel = new ChannelListModel();
+
+    featuredModel = new ChannelListModel();
+
+    gamesModel = new GameListModel();
+
+    //Setup followed channels model and it's signal chain
+    favouritesModel = createFollowedChannelsModel();
+
+    favouritesProxy = new FavourtiteSortFilterProxyModel(this);
+    favouritesProxy->sort(0, Qt::DescendingOrder);
+    favouritesProxy->setSourceModel(favouritesModel);
+    featuredProxy = new QSortFilterProxyModel();
+    featuredProxy->setSourceModel(featuredModel);
+    featuredProxy->setSortRole(ChannelListModel::Roles::ViewersRole);
+    featuredProxy->sort(0, Qt::DescendingOrder);
+
+    connect(netman, &NetworkManager::allStreamsOperationFinished, this, &ChannelManager::updateStreams);
+    connect(netman, &NetworkManager::featuredStreamsOperationFinished, this, &ChannelManager::addFeaturedResults);
+    connect(netman, &NetworkManager::gamesOperationFinished, this, &ChannelManager::addGames);
+    connect(netman, &NetworkManager::gameStreamsOperationFinished, this, &ChannelManager::addSearchResults);
+    connect(netman, &NetworkManager::searchChannelsOperationFinished, this, &ChannelManager::addSearchResults);
+    connect(netman, &NetworkManager::m3u8OperationFinished, this, &ChannelManager::foundPlaybackStream);
+    connect(netman, &NetworkManager::searchGamesOperationFinished, this, &ChannelManager::addGames);
+
+    connect(netman, &NetworkManager::userOperationFinished, this, &ChannelManager::onUserUpdated);
+    connect(netman, &NetworkManager::getEmoteSetsOperationFinished, this, &ChannelManager::onEmoteSetsUpdated);
+    connect(netman, &NetworkManager::getChannelBadgeUrlsOperationFinished, this, &ChannelManager::innerChannelBadgeUrlsLoaded);
+    connect(netman, &NetworkManager::getChannelBadgeBetaUrlsOperationFinished, this, &ChannelManager::innerChannelBadgeBetaUrlsLoaded);
+    connect(netman, &NetworkManager::getGlobalBadgeBetaUrlsOperationFinished, this, &ChannelManager::innerGlobalBadgeBetaUrlsLoaded);
+
+    connect(netman, &NetworkManager::getChannelBitsUrlsOperationFinished, this, &ChannelManager::innerChannelBitsDataLoaded);
+    connect(netman, &NetworkManager::getGlobalBitsUrlsOperationFinished, this, &ChannelManager::innerGlobalBitsDataLoaded);
+
+    connect(netman, &NetworkManager::getGlobalBttvEmotesOperationFinished, this, &ChannelManager::innerGlobalBttvEmotesLoaded);
+    connect(netman, &NetworkManager::getChannelBttvEmotesOperationFinished, this, &ChannelManager::innerChannelBttvEmotesLoaded);
+
+    connect(netman, &NetworkManager::favouritesReplyFinished, this, &ChannelManager::addFollowedResults);
+    connect(netman, &NetworkManager::vodChatPieceGetOperationFinished, this, &ChannelManager::vodChatPieceGetOperationFinished);
+    connect(netman, &NetworkManager::chatterListLoadOperationFinished, this, &ChannelManager::processChatterList);
+
+    connect(netman, &NetworkManager::blockedUserListLoadOperationFinished, this, &ChannelManager::addBlockedUserResults);
+    connect(netman, &NetworkManager::userBlocked, this, &ChannelManager::innerUserBlocked);
+    connect(netman, &NetworkManager::userUnblocked, this, &ChannelManager::innerUserUnblocked);
+
+    connect(netman, &NetworkManager::networkAccessChanged, this, &ChannelManager::onNetworkAccessChanged);
+    load();
+}
+
+ChannelManager::~ChannelManager(){
+    qDebug() << "Destroyer: ChannelManager";
+
+    save();
+
+    delete favouritesModel;
+    delete resultsModel;
+    delete featuredModel;
+    delete gamesModel;
+    delete favouritesProxy;
+    delete featuredProxy;
+}
+
+QSortFilterProxyModel *ChannelManager::getFeaturedProxy() const
+{
+    return featuredProxy;
+}
+
+bool ChannelManager::isAlert() const
+{
+    return alert;
+}
+
+int ChannelManager::getAlertPosition() const
+{
+    return alertPosition;
+}
+
+void ChannelManager::setAlertPosition(const int &value)
+{
+    alertPosition = value;
+}
+
+void ChannelManager::addToFavourites(const quint32 &id, const QString &serviceName, const QString &title,
+                                     const QString &info, const QString &logo, const QString &preview,
+                                     const QString &game, const qint32 &viewers, bool online)
+{
+    if (!favouritesModel->find(id)){
+        Channel *channel = new Channel();
+        channel->setId(id);
+        channel->setServiceName(serviceName);
+        channel->setName(title);
+        channel->setInfo(info);
+        channel->setLogourl(logo);
+        channel->setPreviewurl(preview);
+        channel->setGame(game);
+        channel->setOnline(online);
+        channel->setViewers(viewers);
+
+        if (isAccessTokenAvailable() && user_id != 0) {
+            netman->editUserFavourite(access_token, user_id, channel->getId(), true);
+        }
+
+        favouritesModel->addChannel(channel);
+
+        emit addedChannel(channel->getId());
+
+        Channel *chan = resultsModel->find(channel->getId());
+        if (chan){
+            chan->setFavourite(true);
+            resultsModel->updateChannelForView(chan);
+        }
+
+        //Update featured also
+        chan = featuredModel->find(channel->getId());
+        if (chan){
+            chan->setFavourite(true);
+            featuredModel->updateChannelForView(chan);
+        }
+
+        if (!isAccessTokenAvailable())
+            save();
+    }
+}
+
+bool ChannelManager::isCloseToTray() const
+{
+    return closeToTray;
+}
+
+void ChannelManager::setCloseToTray(bool arg)
+{
+    closeToTray = arg;
+}
+
+void ChannelManager::searchGames(QString q, const quint32 &offset, const quint32 &limit)
+{
+    if (offset == 0 || !q.isEmpty())
+        gamesModel->clear();
+
+    //If query is empty, search games by viewercount
+    if (q.isEmpty())
+        netman->getGames(offset, limit);
+
+    //Else by queryword
+    else if (offset == 0)
+        netman->searchGames(q);
+
+    emit gamesSearchStarted();
+}
+
+QString ChannelManager::username() const
+{
+    return user_name;
+}
+
+QString ChannelManager::accessToken() const
+{
+    return access_token;
+}
+
+void ChannelManager::setAccessToken(const QString &arg)
+{
+    access_token = arg;
+
+    if (isAccessTokenAvailable()) {
+        //Fetch display name for logged in user
+        netman->getUser(access_token);
+
+        //move favs to tempfavs
+        if (!tempFavourites) {
+            tempFavourites = favouritesModel;
+
+            favouritesModel = createFollowedChannelsModel();
+            favouritesProxy->setSourceModel(favouritesModel);
+        }
+    }
+
+    else {
+        // if we just logged out there are user settings to clear
+        user_id = 0;
+        user_name = "";
+
+        //Reload local favourites from memory
+        if (tempFavourites) {
+            delete favouritesModel;
+            favouritesModel = tempFavourites;
+            tempFavourites = 0;
+            favouritesProxy->setSourceModel(favouritesModel);
+        }
+
+        emit login("", "");
+    }
+
+    emit accessTokenUpdated();
+}
+
+ChannelListModel *ChannelManager::getFavouritesModel() const
+{
+    return favouritesModel;
+}
+
+QSortFilterProxyModel *ChannelManager::getFavouritesProxy() const
+{
+    return favouritesProxy;
+}
+
+GameListModel *ChannelManager::getGamesModel() const
+{
+    return gamesModel;
+}
+
+ChannelListModel *ChannelManager::getResultsModel() const
+{
+    return resultsModel;
+}
+
+QString ChannelManager::getQuality() const {
+    return quality;
+}
+
+void ChannelManager::setQuality(const QString & value) {
+    quality = value;
+}
+
+void ChannelManager::setLowLatencyStreams(bool value) {
+    lowLatencyStreams = value;
+}
+
+bool ChannelManager::getLowLatencyStreams() {
+    return lowLatencyStreams;
+}
+
+void ChannelManager::load(){
+    QSettings settings("orion.application", "Orion");
+
+    if (settings.contains("alert")) {
+        alert = settings.value("alert").toBool();
+    }
+
+    if (settings.contains("alertPosition")) {
+        alertPosition = settings.value("alertPosition").toInt();
+    }
+
+    if (settings.contains("closeToTray")) {
+        closeToTray = settings.value("closeToTray").toBool();
+    }
+
+    if (settings.contains("minimizeOnStartup")) {
+        minimizeOnStartup = settings.value("minimizeOnStartup").toBool();
+    }
+
+    if (settings.contains("quality")) {
+        quality = settings.value("quality").toString();
+    }
+
+    if (settings.contains("lowLatencyStreams")) {
+        lowLatencyStreams = settings.value("lowLatencyStreams").toBool();
+    }
+
+    int size = settings.beginReadArray("channels");
+    if (size > 0) {
+        QList<Channel*> _channels;
+
+        for (int i = 0; i < size; i++) {
+            settings.setArrayIndex(i);
+            Channel * channel = new Channel(settings);
+            channel->setFavourite(false); // for visual consistency we don't want to show favourite highlight on entries in the favourites model
+            _channels.append(channel);
+        }
+
+        favouritesModel->addAll(_channels);
+
+        qDeleteAll(_channels);
+    }
+    settings.endArray();
+
+    int numLastPositions = settings.beginReadArray("lastPositions");
+    for (int i = 0; i < numLastPositions; i++) {
+        settings.setArrayIndex(i);
+        const QString channel = settings.value("channel").toString();
+        const QString vod = settings.value("vod").toString();
+        const quint64 lastPosition = settings.value("position").toULongLong();
+
+        vodLastPlaybackPositionLoaded(channel, vod, lastPosition, i);
+    }
+    settings.endArray();
+
+    if (settings.contains("access_token")) {
+        setAccessToken(settings.value("access_token").toString());
+    } else {
+        setAccessToken("");
+    }
+    if (settings.contains("volumeLevel")) {
+        setVolumeLevel(settings.value("volumeLevel").toInt());
+    } else {
+        setVolumeLevel(100);
+    }
+    if(!settings.value("swapChat").isNull()) {
+        _swapChat = settings.value("swapChat").toBool();
+    }
+    if (!settings.value("textScaleFactor").isNull()) {
+        _textScaleFactor = settings.value("textScaleFactor").toDouble();
+    }
+    if(!settings.value("notifications").isNull()) {
+        offlineNotifications = settings.value("notifications").toBool();
+    }
+}
+
+void ChannelManager::save()
+{
+    QSettings settings("orion.application", "Orion");
+
+    if (!settings.isWritable())
+        qDebug() << "Error: settings file not writable";
+
+    if (tempFavourites) {
+        delete favouritesModel;
+        favouritesModel = tempFavourites;
+        tempFavourites = 0;
+    }
+
+    settings.setValue("alert", alert);
+    settings.setValue("alertPosition", alertPosition);
+    settings.setValue("closeToTray", closeToTray);
+    settings.setValue("access_token", access_token);
+    settings.setValue("volumeLevel", volumeLevel);
+    settings.setValue("minimizeOnStartup", minimizeOnStartup);
+    settings.setValue("swapChat", _swapChat);
+    settings.setValue("notifications", offlineNotifications);
+    settings.setValue("textScaleFactor", _textScaleFactor);
+    settings.setValue("quality", quality);
+    settings.setValue("lowLatencyStreams", lowLatencyStreams);
+
+    //Write channels
+    settings.beginWriteArray("channels");
+    for (int i=0; i < favouritesModel->count(); i++){
+        settings.setArrayIndex(i);
+        favouritesModel->getChannels().at(i)->writeToSettings(settings);
+    }
+    settings.endArray();
+
+    //Write last positions
+    int nextLastPositionEntry = settings.beginReadArray("lastPositions");
+    settings.endArray();
+
+    settings.beginWriteArray("lastPositions");
+    for (auto channelEntry = channelVodLastPositions.begin(); channelEntry != channelVodLastPositions.end(); channelEntry++) {
+        auto & vods = channelEntry.value();
+        for (auto vodEntry = vods.begin(); vodEntry != vods.end(); vodEntry++) {
+            auto & lastPosition = vodEntry.value();
+            if (lastPosition.modified) {
+                if (lastPosition.settingsIndex == -1) {
+                    lastPosition.settingsIndex = nextLastPositionEntry++;
+                }
+
+                settings.setArrayIndex(lastPosition.settingsIndex);
+                settings.setValue("channel", channelEntry.key());
+                settings.setValue("vod", vodEntry.key());
+                settings.setValue("position", vodEntry.value().lastPosition);
+            }
+        }
+    }
+    settings.endArray();
+}
+
+void ChannelManager::setVodLastPlaybackPosition(const QString & channel, const QString & vod, quint64 position) {
+    auto channelEntry = channelVodLastPositions.find(channel);
+    if (channelEntry == channelVodLastPositions.end()) {
+        channelEntry = channelVodLastPositions.insert(channel, QMap<QString, LastPosition>());
+    }
+
+    auto & vodMap = channelEntry.value();
+    auto vodEntry = vodMap.find(vod);
+    if (vodEntry != vodMap.end()) {
+        vodEntry.value().lastPosition = position;
+        vodEntry.value().modified = true;
+    }
+    else {
+        // -1 index to be replaced at settings save time
+        vodMap.insert(vod, {position, true, -1});
+    }
+
+    emit vodLastPositionUpdated(channel, vod, position);
+}
+
+void ChannelManager::vodLastPlaybackPositionLoaded(const QString & channel, const QString & vod, quint64 position, int settingsIndex) {
+    auto channelEntry = channelVodLastPositions.find(channel);
+    if (channelEntry == channelVodLastPositions.end()) {
+        channelEntry = channelVodLastPositions.insert(channel, QMap<QString, LastPosition>());
+    }
+
+    auto & vodMap = channelEntry.value();
+    vodMap.remove(vod);
+    vodMap.insert(vod, {position, false, settingsIndex});
+}
+
+QVariant ChannelManager::getVodLastPlaybackPosition(const QString & channel, const QString & vod) {
+    auto channelEntry = channelVodLastPositions.find(channel);
+    if (channelEntry == channelVodLastPositions.end()) {
+        return QVariant();
+    }
+    
+    auto & vodMap = channelEntry.value();
+    auto vodEntry = vodMap.find(vod);
+    if (vodEntry == vodMap.end()) {
+        return QVariant();
+    }
+
+    return vodEntry.value().lastPosition;
+}
+
+QVariantMap ChannelManager::getChannelVodsLastPlaybackPositions(const QString & channel) {
+    QVariantMap out;
+    auto channelEntry = channelVodLastPositions.find(channel);
+    if (channelEntry != channelVodLastPositions.end()) {
+        auto & vodMap = channelEntry.value();
+        for (auto vodEntry = vodMap.constBegin(); vodEntry != vodMap.constEnd(); vodEntry++) {
+            out.insert(vodEntry.key(), vodEntry.value().lastPosition);
+        }
+    }
+    return out;
+}
+
+void ChannelManager::addToFavourites(const quint32 &id){
+    Channel *channel = resultsModel->find(id);
+
+    if (!channel){
+        channel = featuredModel->find(id);
+    }
+
+    if (channel){
+
+        if (isAccessTokenAvailable() && user_id != 0) {
+            netman->editUserFavourite(access_token, user_id, channel->getId(), true);
+        }
+
+        favouritesModel->addChannel(new Channel(*channel));
+
+        channel->setFavourite(true);
+        emit addedChannel(channel->getId());
+
+        resultsModel->updateChannelForView(channel);
+
+        //Update featured also
+        featuredModel->updateChannelForView(channel);
+
+        if (!isAccessTokenAvailable())
+            save();
+    }
+}
+
+void ChannelManager::removeFromFavourites(const quint32 &id){
+    Channel *chan = favouritesModel->find(id);
+
+    emit deletedChannel(chan->getId());
+
+    if (isAccessTokenAvailable() && user_id != 0) {
+        netman->editUserFavourite(access_token, user_id, chan->getId(), false);
+    }
+
+    favouritesModel->removeChannel(chan);
+
+    chan = 0;
+
+    //Update results
+    Channel* channel = resultsModel->find(id);
+    if (channel){
+
+        channel->setFavourite(false);
+        resultsModel->updateChannelForView(channel);
+    }
+
+    //Update featured
+    channel = featuredModel->find(id);
+    if (channel){
+        channel->setFavourite(false);
+        featuredModel->updateChannelForView(channel);
+    }
+
+    if (!isAccessTokenAvailable())
+        save();
+}
+
+QString commaSeparatedChannelIds(const QList<Channel *> & channels) {
+    QStringList channelIdStrs;
+    foreach(Channel* channel, channels) {
+        channelIdStrs.append(QString::number(channel->getId()));
+    }
+    return channelIdStrs.join(',');
+}
+
+void ChannelManager::checkStreams(const QList<Channel *> &list)
+{
+    //Divide list to sublists for sanity
+    int pos = 0;
+
+    while(pos < list.length()) {
+
+        //Take sublist, max 50 items
+        QList<Channel*> sublist = list.mid(pos, 50);
+
+        //Fetch channels
+        QString url = KRAKEN_API
+                + QString("/streams?")
+                + QString("limit=%1").arg(50) //Important!
+                + QString("&channel=") + commaSeparatedChannelIds(sublist);
+        netman->getStreams(url);
+
+        //Shift pos by 50
+        pos += sublist.length();
+    }
+}
+
+void ChannelManager::checkFavourites()
+{
+    checkStreams(favouritesModel->getChannels());
+}
+
+void ChannelManager::searchChannels(QString q, const quint32 &offset, const quint32 &limit, bool clear)
+{
+    if (clear)
+        resultsModel->clear();
+
+    if (q.startsWith(":game ")){
+        q.replace(":game ", "");
+        netman->getStreamsForGame(q, offset, limit);
+
+    } else {
+        netman->searchChannels(q, offset, limit);
+    }
+
+    emit searchingStarted();
+}
+
+void ChannelManager::addSearchResults(const QList<Channel*> &list, const int total)
+{
+    bool needsStreamCheck = false;
+
+    foreach (Channel *channel, list){
+        if (favouritesModel->find(channel->getId()))
+            channel->setFavourite(true);
+
+        if (!channel->isOnline())
+            needsStreamCheck = true;
+    }
+
+    int numAdded = resultsModel->addAll(list);
+
+    if (needsStreamCheck)
+        checkStreams(list);
+
+    qDeleteAll(list);
+
+    emit resultsUpdated(numAdded, total);
+}
+
+void ChannelManager::getFeatured()
+{
+    featuredModel->clear();
+
+    netman->getFeaturedStreams();
+}
+
+void ChannelManager::findPlaybackStream(const QString &serviceName)
+{
+    netman->getChannelPlaybackStream(serviceName);
+}
+
+void ChannelManager::setAlert(const bool &val)
+{
+    alert = val;
+}
+
+void ChannelManager::addFeaturedResults(const QList<Channel *> &list)
+{
+    foreach (Channel *channel, list){
+        if (favouritesModel->find(channel->getId()))
+            channel->setFavourite(true);
+    }
+
+    featuredModel->addAll(list);
+
+    qDeleteAll(list);
+
+    emit featuredUpdated();
+}
+
+void ChannelManager::updateFavourites(const QList<Channel*> &list)
+{
+    favouritesModel->updateChannels(list);
+    qDeleteAll(list);
+}
+
+bool ChannelManager::containsFavourite(const quint32 &q)
+{
+    return favouritesModel->find(q) != nullptr;
+}
+
+//Updates channel streams in all models
+void ChannelManager::updateStreams(const QList<Channel*> &list)
+{
+    favouritesModel->updateStreams(list);
+    featuredModel->updateStreams(list);
+    resultsModel->updateStreams(list);
+    qDeleteAll(list);
+}
+
+void ChannelManager::addGames(const QList<Game*> &list)
+{
+    gamesModel->addAll(list);
+
+    qDeleteAll(list);
+
+    emit gamesUpdated();
+}
+
+void ChannelManager::notify(Channel *channel)
+{
+    if (alert && channel){
+
+        if (!channel->isOnline() && !offlineNotifications)
+            //Skip offline notifications if set
+            return;
+
+        emit pushNotification(channel->getName() + (channel->isOnline() ? " is now streaming" : " has gone offline"),
+                              channel->getInfo(),
+                              channel->getLogourl());
+    }
+}
+
+void ChannelManager::notifyMultipleChannelsOnline(const QList<Channel*> &channels)
+{
+    if (channels.size() == 1) {
+        //Only one channel, send the usual notification
+        notify(channels.at(0));
+    }
+
+    else if (alert) {
+        //Send multi-notification
+        QString str;
+
+        foreach (Channel *c, channels) {
+
+            //Omit channels after enough characters in message body
+            if (str.size() > 80) {
+                str.append("...");
+                break;
+            }
+
+            str.append(!str.isEmpty() ? ", " : "");
+            str.append(c->getName());
+        }
+
+        emit pushNotification("Channels are streaming", str, DEFAULT_LOGO_URL);
+    }
+}
+
+//Login function
+void ChannelManager::onUserUpdated(const QString &name, const quint64 userId)
+{
+    user_name = name;
+    user_id = userId;
+    emit userNameUpdated(user_name);
+
+    if (isAccessTokenAvailable()) {
+        emit login(user_name, access_token);
+
+        //Start using user followed channels
+        getFollowedChannels(FOLLOWED_FETCH_LIMIT, 0);
+        getBlockedUserList();
+    }
+}
+
+QVariantMap convertEmoteSets(const QMap<int, QMap<int, QString>> emoteSets) {
+    QVariantMap out;
+    for (auto setEntry = emoteSets.begin(); setEntry != emoteSets.end(); setEntry++) {
+        QVariantMap cur;
+        auto set = setEntry.value();
+        for (auto emote = set.begin(); emote != set.end(); emote++) {
+            cur.insert(QString::number(emote.key()), emote.value());
+        }
+        out.insert(QString::number(setEntry.key()), cur);
+    }
+    return out;
+}
+
+bool ChannelManager::loadEmoteSets(bool reload, const QList<int> &emoteSetIDs) {
+    if (!haveEmoteSets || (emoteSetIDs != lastRequestedEmoteSetIDs)) {
+        reload = true;
+    }
+
+    if (reload) {
+        if (isAccessTokenAvailable()) {
+            haveEmoteSets = false;
+            lastRequestedEmoteSetIDs = emoteSetIDs;
+            netman->getEmoteSets(access_token, emoteSetIDs);
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+    else {
+        // ok to deliver cached emote sets
+        emit emoteSetsLoaded(convertEmoteSets(lastEmoteSets));
+        return true;
+    }
+}
+
+QVariantMap convertBadges(const QMap<QString, QMap<QString, QString>> &badges) {
+    QVariantMap out;
+    for (auto x = badges.constBegin(); x != badges.constEnd(); x++) {
+        QVariantMap cur;
+        auto badgeEntries = x.value();
+        for (auto y = badgeEntries.constBegin(); y != badgeEntries.constEnd(); y++) {
+            cur.insert(y.key(), y.value());
+        }
+        out.insert(x.key(), cur);
+    }
+    return out;
+}
+
+QVariantMap convertBetaBadges(const QMap<QString, QMap<QString, QMap<QString, QString>>> &badges) {
+    QVariantMap out;
+    for (auto x = badges.constBegin(); x != badges.constEnd(); x++) {
+        out.insert(x.key(), convertBadges(x.value()));
+    }
+    return out;
+}
+
+bool ChannelManager::loadChannelBadgeUrls(const quint64 channelId) {
+    auto result = channelBadgeUrls.find(QString::number(channelId));
+    if (result != channelBadgeUrls.end()) {
+        // deliver cached channel badge URLs
+        emit channelBadgeUrlsLoaded(channelId, convertBadges(result.value()));
+        return false;
+    }
+    else {
+        netman->getChannelBadgeUrls(access_token, channelId);
+        return true;
+    }
+}
+
+bool ChannelManager::loadChannelBetaBadgeUrls(int channel) {
+    bool out = false;
+
+    const QString channelKey = QString::number(channel);
+    auto result = channelBadgeBetaUrls.constFind(channelKey);
+    if (result != channelBadgeBetaUrls.constEnd()) {
+        // deliver cached channel beta badge URLS
+        emit channelBadgeBetaUrlsLoaded(channelKey, convertBetaBadges(result.value()));
+    }
+    else {
+        netman->getChannelBadgeUrlsBeta(channel);
+        out = true;
+    }
+
+    const QString GLOBAL_BADGES_IDENTIFIER = "GLOBAL";
+    result = channelBadgeBetaUrls.find(GLOBAL_BADGES_IDENTIFIER);
+    if (result != channelBadgeBetaUrls.end()) {
+        // deliver cached channel beta badge URLS
+        emit channelBadgeBetaUrlsLoaded(GLOBAL_BADGES_IDENTIFIER, convertBetaBadges(result.value()));
+    }
+    else {
+        netman->getGlobalBadgesUrlsBeta();
+        out = true;
+    }
+
+    return out;
+}
+
+bool ChannelManager::loadChannelBttvEmotes(const QString channel) {
+    bool out = false;
+
+    auto result = channelBttvEmotes.constFind(channel);
+    if (result != channelBttvEmotes.constEnd()) {
+        // deliver cached channel bttv emotes
+        emit channelBttvEmotesLoaded(channel, result.value());
+    }
+    else {
+        netman->getChannelBttvEmotes(channel);
+        out = true;
+    }
+
+    const QString GLOBAL_EMOTES_IDENTIFIER = "GLOBAL";
+    result = channelBttvEmotes.constFind(GLOBAL_EMOTES_IDENTIFIER);
+    if (result != channelBttvEmotes.constEnd()) {
+        emit channelBttvEmotesLoaded(GLOBAL_EMOTES_IDENTIFIER, result.value());
+    }
+    else {
+        netman->getGlobalBttvEmotes();
+        out = true;
+    }
+
+    return out;
+}
+
+/*
+QVariantMap convertBitsUrls(const QMap<QString, QMap<QString, QString>> & bitsUrls) {
+    QVariantMap out;
+    for (auto one = bitsUrls.constBegin(); one != bitsUrls.constEnd(); one++) {
+        const auto & twoMap = one.value();
+        QVariantMap oneObj;
+        for (auto two = twoMap.constBegin(); two != twoMap.constEnd(); two++) {
+            oneObj.insert(two.key(), two.value());
+        }
+        out.insert(one.key(), oneObj);
+    }
+
+    return out;
+}
+*/
+
+bool ChannelManager::loadChannelBitsUrls(int channel) {
+    bool out = false;
+
+    const int GLOBAL_BITS_IDENTIFIER = -1;
+
+    auto result = channelBitsUrls.find(channel);
+    if (result != channelBitsUrls.end()) {
+        // deliver cached channel bits URLS
+        auto colors = channelBitsColors.find(channel);
+
+        emit channelBitsUrlsLoaded(channel, result.value(), colors.value());
+    }
+    else {
+        netman->getChannelBitsUrls(channel);
+        out = true;
+    }
+
+    result = channelBitsUrls.find(GLOBAL_BITS_IDENTIFIER);
+    if (result != channelBitsUrls.end()) {
+        // deliver cached channel bits URLS
+        auto colors = channelBitsColors.find(GLOBAL_BITS_IDENTIFIER);
+
+        emit channelBitsUrlsLoaded(GLOBAL_BITS_IDENTIFIER, result.value(), colors.value());
+    }
+    else {
+        netman->getGlobalBitsUrls();
+        out = true;
+    }
+
+    return out;
+}
+
+void ChannelManager::loadChatterList(const QString channel) {
+    netman->loadChatterList(channel);
+}
+
+void ChannelManager::getVodChatPiece(quint64 vodId, quint64 offset) {
+    netman->getVodChatPiece(vodId, offset);
+}
+
+void ChannelManager::getNextVodChatPiece(quint64 vodId, QString cursor) {
+    netman->getNextVodChatPiece(vodId, cursor);
+}
+
+void ChannelManager::cancelLastVodChatRequest() {
+    netman->cancelLastVodChatRequest();
+}
+
+void ChannelManager::resetVodChat() {
+    netman->resetVodChat();
+}
+
+void ChannelManager::onEmoteSetsUpdated(const QMap<int, QMap<int, QString>> updatedEmoteSets)
+{
+    lastEmoteSets = updatedEmoteSets;
+    haveEmoteSets = true;
+
+    //qDebug() << "emitting updated emote set" << updatedEmoteSets;
+
+    emit emoteSetsLoaded(convertEmoteSets(updatedEmoteSets));
+}
+
+void ChannelManager::innerChannelBadgeUrlsLoaded(const quint64 channelId, const QMap<QString, QMap<QString, QString>> badgeUrls)
+{
+    const QString channelIdStr = QString::number(channelId);
+    channelBadgeUrls.remove(channelIdStr);
+    channelBadgeUrls.insert(channelIdStr, badgeUrls);
+
+    emit channelBadgeUrlsLoaded(channelId, convertBadges(badgeUrls));
+}
+
+void ChannelManager::innerChannelBadgeBetaUrlsLoaded(const int channelId, const QMap<QString, QMap<QString, QMap<QString, QString>>> badgeData)
+{
+    QString channelKey = QString::number(channelId);
+    channelBadgeBetaUrls.remove(channelKey);
+    channelBadgeBetaUrls.insert(channelKey, badgeData);
+
+    emit channelBadgeBetaUrlsLoaded(channelKey, convertBetaBadges(badgeData));
+}
+
+void ChannelManager::innerGlobalBadgeBetaUrlsLoaded(const QMap<QString, QMap<QString, QMap<QString, QString>>> badgeData)
+{
+    const QString GLOBAL_BADGES_KEY = "GLOBAL";
+    channelBadgeBetaUrls.remove(GLOBAL_BADGES_KEY);
+    channelBadgeBetaUrls.insert(GLOBAL_BADGES_KEY, badgeData);
+
+    emit channelBadgeBetaUrlsLoaded(GLOBAL_BADGES_KEY, convertBetaBadges(badgeData));
+}
+
+void ChannelManager::innerChannelBitsDataLoaded(int channelID, QMap<QString, QMap<QString, QString>> curChannelBitsUrls, QMap<QString, QMap<QString, QString>> curChannelBitsColors) {
+    channelBitsUrls.remove(channelID);
+    channelBitsUrls.insert(channelID, curChannelBitsUrls);
+
+    channelBitsColors.remove(channelID);
+    channelBitsColors.insert(channelID, curChannelBitsColors);
+
+    emit channelBitsUrlsLoaded(channelID, curChannelBitsUrls, curChannelBitsColors);
+}
+
+void ChannelManager::innerGlobalBitsDataLoaded(QMap<QString, QMap<QString, QString>> globalBitsUrls, QMap<QString, QMap<QString, QString>> globalBitsColors) {
+    const int GLOBAL_BITS_KEY = -1;
+    channelBitsUrls.remove(GLOBAL_BITS_KEY);
+    channelBitsUrls.insert(GLOBAL_BITS_KEY, globalBitsUrls);
+
+    channelBitsColors.remove(GLOBAL_BITS_KEY);
+    channelBitsColors.insert(GLOBAL_BITS_KEY, globalBitsColors);
+
+    emit channelBitsUrlsLoaded(GLOBAL_BITS_KEY, globalBitsUrls, globalBitsColors);
+}
+
+void ChannelManager::innerChannelBttvEmotesLoaded(const QString channel, QMap<QString, QString> & emotesByCode) {
+    channelBttvEmotes.remove(channel);
+    channelBttvEmotes.insert(channel, emotesByCode);
+    emit channelBttvEmotesLoaded(channel, emotesByCode);
+}
+
+void ChannelManager::innerGlobalBttvEmotesLoaded(QMap<QString, QString> & emotesByCode) {
+    const QString GLOBAL_EMOTES_KEY = "GLOBAL";
+    channelBttvEmotes.remove(GLOBAL_EMOTES_KEY);
+    channelBttvEmotes.insert(GLOBAL_EMOTES_KEY, emotesByCode);
+    emit channelBttvEmotesLoaded(GLOBAL_EMOTES_KEY, emotesByCode);
+}
+
+void ChannelManager::getFollowedChannels(const quint32& limit, const quint32& offset)
+{
+    //if (offset == 0)
+    //favouritesModel->clear();
+
+    netman->getUserFavourites(user_id, offset, limit);
+}
+
+
+void ChannelManager::addFollowedResults(const QList<Channel *> &list, const quint32 offset, const quint32 total)
+{
+    //    qDebug() << "Merging channel data for " << list.size()
+    //             << " items with " << offset << " offset.";
+
+    favouritesModel->mergeAll(list);
+
+    if (offset < total)
+        getFollowedChannels(FOLLOWED_FETCH_LIMIT, offset);
+
+    checkStreams(list);
+
+    qDeleteAll(list);
+
+    emit followedUpdated();
+}
+
+const quint32 ChannelManager::BLOCKED_USER_LIST_FETCH_LIMIT = 100;
+
+void ChannelManager::getBlockedUserList()
+{
+    blockedUserListLoading.clear();
+    netman->getBlockedUserList(accessToken(), user_id, 0, BLOCKED_USER_LIST_FETCH_LIMIT);
+}
+
+void ChannelManager::addBlockedUserResults(const QList<QString> & list, const quint32 nextOffset, const quint32 total)
+{
+    if (!user_id || accessToken().isEmpty()) return;
+
+    blockedUserListLoading.append(list);
+
+    if (nextOffset < total) {
+        netman->getBlockedUserList(accessToken(), user_id, nextOffset, BLOCKED_USER_LIST_FETCH_LIMIT);
+    }
+    else {
+        emit blockedUsersLoaded(blockedUserListLoading.toSet());
+    }
+}
+
+void ChannelManager::processChatterList(QMap<QString, QList<QString>> chatters)
+{
+    QVariantMap out;
+    for (auto groupEntry = chatters.constBegin(); groupEntry != chatters.constEnd(); groupEntry++) {
+        QVariantList group;
+        for (const auto & chatter : groupEntry.value()) {
+            group.append(chatter);
+        }
+        out.insert(groupEntry.key(), group);
+    }
+
+    emit chatterListLoaded(out);
+}
+
+void ChannelManager::onNetworkAccessChanged(bool up)
+{
+    if (up) {
+        if (isAccessTokenAvailable()) {
+            //Relogin
+            favouritesModel->clear();
+            netman->getUser(access_token);
+        }
+    } else {
+        qDebug() << "Network went down";
+        favouritesModel->setAllChannelsOffline();
+        resultsModel->setAllChannelsOffline();
+        featuredModel->setAllChannelsOffline();
+    }
+}
+int ChannelManager::getVolumeLevel() const {
+    return volumeLevel;
+}
+void ChannelManager::setVolumeLevel(const int &value) {
+    volumeLevel = value;
+}
+
+bool ChannelManager::isMinimizeOnStartup() const
+{
+    return minimizeOnStartup;
+}
+
+void ChannelManager::setMinimizeOnStartup(bool value)
+{
+    minimizeOnStartup = value;
+}
+
+void ChannelManager::setSwapChat(bool value) {
+    _swapChat = value;
+    emit swapChatChanged();
+}
+
+bool ChannelManager::getSwapChat() {
+    return _swapChat;
+}
+
+double ChannelManager::getTextScaleFactor() {
+    return _textScaleFactor;
+}
+
+void ChannelManager::setTextScaleFactor(double value) {
+    _textScaleFactor = value;
+    emit textScaleFactorChanged();
+}
+
+void ChannelManager::setOfflineNotifications(bool value) {
+    offlineNotifications = value;
+    emit notificationsChanged();
+}
+
+bool ChannelManager::getOfflineNotifications() {
+    return offlineNotifications;
+}
+
+void ChannelManager::editUserBlock(const QString & blockUserName, const bool isBlock) {
+    if (isAccessTokenAvailable()) {
+        netman->editUserBlock(accessToken(), user_id, blockUserName, isBlock);
+    }
+}
+
+void ChannelManager::innerUserBlocked(quint64 myUserId, const QString & blockedUsername) {
+    if (user_id == myUserId) {
+        emit userBlocked(blockedUsername);
+    }
+}
+
+void ChannelManager::innerUserUnblocked(quint64 myUserId, const QString & unblockedUsername) {
+    if (user_id == myUserId) {
+        emit userUnblocked(unblockedUsername);
+    }
+}
